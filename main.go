@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vincent-petithory/dataurl"
 )
 
 func main() {
@@ -112,7 +116,7 @@ func consumeQueue(in chan Queue, outDir string) chan Queue {
 					return
 				}
 
-				q.LocalFilepath, q.Error = saveFavicon(q.FaviconURL, q.FileNamePrefix, outDir)
+				q.LocalFilepath, q.Error = saveFavicon(q.URL, q.FaviconURL, q.FileNamePrefix, outDir)
 				next <- q
 			}()
 		}
@@ -132,8 +136,12 @@ type Queue struct {
 	LocalFilepath []string
 }
 
-func fetchAndFindFaviconURL(baseURL string) ([]string, error) {
-	resp, err := http.Get(baseURL)
+func fetchAndFindFaviconURL(baseRawURL string) ([]string, error) {
+	baseURL, err := url.Parse(baseRawURL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.Get(baseRawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +185,15 @@ func fetchAndFindFaviconURL(baseURL string) ([]string, error) {
 			if refEnd == -1 {
 				continue
 			}
-			faviconURLs[t[refStart:refStart+refEnd]] = struct{}{}
+
+			href := t[refStart : refStart+refEnd]
+			hrefU, err := url.Parse(href)
+			if err != nil {
+				return nil, err
+			}
+			hrefU = baseURL.ResolveReference(hrefU)
+
+			faviconURLs[hrefU.String()] = struct{}{}
 		}
 	}
 
@@ -186,35 +202,75 @@ func fetchAndFindFaviconURL(baseURL string) ([]string, error) {
 		ret = append(ret, k)
 	}
 
+	if len(ret) == 0 {
+		ret = append(ret, baseURL.Scheme+"://"+baseURL.Host+"/favicon.ico")
+	}
+
 	return ret, nil
 }
 
-func saveFavicon(urls []string, fileNamePrefix string, outputDir string) ([]string, error) {
+func saveFavicon(baseURL string, urls []string, fileNamePrefix string, outputDir string) ([]string, error) {
 	results := []string{}
 
 	for i, u := range urls {
-		resp, err := http.Get(u)
+		i := i
+		u := u
+		err := func() error {
+			var (
+				content io.Reader
+				outPath string
+			)
+
+			if strings.HasPrefix(u, "data:") {
+				durl, err := dataurl.DecodeString(u)
+				if err != nil {
+					return err
+				}
+				content = bytes.NewReader(durl.Data)
+
+				exts, err := mime.ExtensionsByType(durl.ContentType())
+				if err != nil {
+					return err
+				}
+				if len(exts) == 0 {
+					return fmt.Errorf("unknown mime type: %s", durl.ContentType())
+				}
+				outPath = filepath.Join(outputDir, fileNamePrefix+"favicon"+exts[0])
+			} else {
+				resp, err := http.Get(u)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				content = resp.Body
+
+				if resp.StatusCode != http.StatusOK {
+					return nil
+				}
+				outPath = filepath.Join(outputDir, fileNamePrefix+path.Base(resp.Request.URL.Path))
+			}
+
+			out, err := os.Create(outPath)
+			if err != nil {
+				return err
+			}
+			defer out.Close()
+
+			if _, err := io.Copy(out, content); err != nil {
+				return err
+			}
+
+			results = append(results, outPath)
+
+			return nil
+		}()
+
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
-
-		outPath := filepath.Join(outputDir, fileNamePrefix+path.Base(u))
-		out, err := os.Create(outPath)
-		if err != nil {
-			return nil, err
-		}
-		defer out.Close()
-
-		if _, err := io.Copy(out, resp.Body); err != nil {
-			return nil, err
-		}
-
-		results = append(results, outPath)
-
 		if len(urls) > i-1 {
 			time.Sleep(time.Second)
 		}
 	}
-	return nil, nil
+	return results, nil
 }
